@@ -285,6 +285,196 @@ $$;
 COMMENT ON FUNCTION dev.get_whatsapp_user IS 
 'Finds user by WhatsApp ID. Returns user integration details for WhatsApp service.';
 
+-- Get user by Telegram ID
+CREATE OR REPLACE FUNCTION dev.get_user_id_by_telegram_id(p_telegram_id text)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT user_id 
+    FROM dev.user_integrations 
+    WHERE service_id = 'telegram' 
+      AND external_user_id = p_telegram_id
+      AND is_active = true
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_user_id_by_telegram_id IS 
+'Returns user_id for a telegram_id. Returns NULL if not found.';
+
+CREATE OR REPLACE FUNCTION dev.get_user_by_telegram_id(p_telegram_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT row_to_json(u.*)::jsonb
+    FROM dev.users u
+    JOIN dev.user_integrations ui ON u.id = ui.user_id
+    WHERE ui.service_id = 'telegram' 
+      AND ui.external_user_id = p_telegram_id
+      AND ui.is_active = true
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_user_by_telegram_id IS 
+'Returns full user record for a telegram_id. Returns NULL if not found.';
+
+-- ============================================================================
+-- FUNCTION 4b: Telegram Signup Token Functions
+-- ============================================================================
+
+-- Find user by Telegram signup token (for linking telegram_id to existing user)
+CREATE OR REPLACE FUNCTION dev.find_user_by_telegram_signup_token(p_signup_token text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'user_id', ui.user_id,
+        'service_id', ui.service_id,
+        'external_user_id', ui.external_user_id,
+        'display_label', ui.display_label,
+        'created_at', ui.created_at,
+        'email', u.email,
+        'display_name', u.display_name
+    )
+    FROM dev.user_integrations ui
+    JOIN dev.users u ON ui.user_id = u.id
+    WHERE ui.service_id = 'telegram'
+      AND ui.credentials->>'signup_token' = p_signup_token
+      AND ui.is_active = true
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.find_user_by_telegram_signup_token IS 
+'Finds user by Telegram signup token. Returns user and integration details. Used for Telegram ID linking flow.';
+
+-- Link Telegram ID to user and clear signup token
+CREATE OR REPLACE FUNCTION dev.complete_telegram_link(
+    p_signup_token text,
+    p_telegram_id text,
+    p_telegram_username text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_user_id text;
+    v_updated_count int;
+BEGIN
+    -- Find the user by signup token
+    SELECT user_id INTO v_user_id
+    FROM dev.user_integrations
+    WHERE service_id = 'telegram'
+      AND credentials->>'signup_token' = p_signup_token
+      AND is_active = true
+    LIMIT 1;
+    
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'No active integration found for signup_token=%', p_signup_token;
+    END IF;
+    
+    -- Update with telegram_id and remove signup_token
+    UPDATE dev.user_integrations
+    SET 
+        external_user_id = p_telegram_id,
+        external_username = p_telegram_username,
+        credentials = COALESCE(credentials, '{}'::jsonb) - 'signup_token', -- Remove the key
+        updated_at = now()
+    WHERE user_id = v_user_id
+      AND service_id = 'telegram'
+      AND is_active = true;
+    
+    GET DIAGNOSTICS v_updated_count = ROW_COUNT;
+    
+    IF v_updated_count = 0 THEN
+        RAISE EXCEPTION 'Failed to update integration for user_id=%', v_user_id;
+    END IF;
+    
+    RETURN jsonb_build_object(
+        'success', true,
+        'user_id', v_user_id,
+        'telegram_id', p_telegram_id,
+        'telegram_username', p_telegram_username,
+        'linked_at', now()
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION dev.complete_telegram_link IS 
+'Completes Telegram linking flow: finds user by signup_token, sets their telegram_id, and removes the signup_token.';
+
+-- Set signup token for Telegram integration (when creating initial integration)
+CREATE OR REPLACE FUNCTION dev.set_telegram_signup_token(
+    p_user_id text,
+    p_signup_token text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_updated_count int;
+    v_has_integration boolean;
+BEGIN
+    -- Check if integration exists
+    SELECT EXISTS(
+        SELECT 1 FROM dev.user_integrations 
+        WHERE user_id = p_user_id AND service_id = 'telegram'
+    ) INTO v_has_integration;
+    
+    IF NOT v_has_integration THEN
+        -- Create integration with signup token
+        INSERT INTO dev.user_integrations (
+            user_id,
+            service_id,
+            is_active,
+            display_label,
+            credentials
+        ) VALUES (
+            p_user_id,
+            'telegram',
+            true,
+            'Telegram',
+            jsonb_build_object('signup_token', p_signup_token)
+        );
+        
+        RETURN jsonb_build_object(
+            'success', true,
+            'action', 'created',
+            'user_id', p_user_id,
+            'signup_token', p_signup_token,
+            'created_at', now()
+        );
+    ELSE
+        -- Update existing integration
+        UPDATE dev.user_integrations
+        SET 
+            credentials = jsonb_set(
+                COALESCE(credentials, '{}'::jsonb),
+                '{signup_token}',
+                to_jsonb(p_signup_token)
+            ),
+            updated_at = now()
+        WHERE user_id = p_user_id
+          AND service_id = 'telegram'
+          AND is_active = true;
+        
+        GET DIAGNOSTICS v_updated_count = ROW_COUNT;
+        
+        RETURN jsonb_build_object(
+            'success', true,
+            'action', 'updated',
+            'user_id', p_user_id,
+            'signup_token', p_signup_token,
+            'updated_at', now()
+        );
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION dev.set_telegram_signup_token IS 
+'Sets or updates Telegram signup token for a user. Creates integration if it doesn''t exist.';
+
 -- ============================================================================
 -- FUNCTION 5: Service Linking Functions (CREATE Operations)
 -- ============================================================================
@@ -1112,10 +1302,25 @@ COMMENT ON FUNCTION dev.cleanup_orphaned_integrations IS
 -- Example 4: Get all service IDs for user
 -- SELECT dev.get_user_services('user_123');
 
--- Example 5: Find user by telegram ID
+-- Example 5: Find user by telegram ID (returns just user_id)
+-- SELECT dev.get_user_id_by_telegram_id('telegram_456');
+
+-- Example 5a: Find full user by telegram ID (returns full user object)
+-- SELECT dev.get_user_by_telegram_id('telegram_456');
+
+-- Example 5b: Find integration by external ID
 -- SELECT dev.get_integration_by_external_id('telegram', 'telegram_456');
 
--- Example 5b: Find user by WhatsApp ID
+-- Example 5d: Find user by Telegram signup token
+-- SELECT dev.find_user_by_telegram_signup_token('TOKEN_12345');
+
+-- Example 5e: Complete Telegram linking (set telegram_id and clear signup token)
+-- SELECT dev.complete_telegram_link('TOKEN_12345', 'telegram_456', '@username');
+
+-- Example 5f: Set signup token for a user
+-- SELECT dev.set_telegram_signup_token('user_123', 'TOKEN_12345');
+
+-- Example 5g: Find user by WhatsApp ID
 -- SELECT dev.get_whatsapp_user('whatsapp_789');
 
 -- Example 6: Update Gmail token (N8N after OAuth refresh)

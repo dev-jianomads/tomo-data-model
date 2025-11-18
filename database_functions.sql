@@ -1686,7 +1686,7 @@ COMMENT ON FUNCTION dev.cleanup_orphaned_integrations IS
 -- SELECT dev.link_slack_to_user(
 --   'user_123',
 --   'T01234567', -- team_id from Slack OAuth
---   'xoxb-1234567890...', -- bot token
+--   'xoxb-1234567890...', 
 --   'A01234567', -- app_id (your Slack app ID)
 --   'My Workspace', -- team_name
 --   'U01234567', -- bot_user_id

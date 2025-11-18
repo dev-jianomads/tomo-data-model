@@ -245,7 +245,8 @@ INSERT INTO dev.services (id, name, type, provider, is_active, metadata) VALUES
     ('google_calendar', 'Google Calendar', 'calendar', 'google', true, '{"icon": "calendar", "color": "#4285F4"}'::jsonb),
     ('telegram', 'Telegram', 'messaging', 'telegram', true, '{"icon": "telegram", "color": "#0088cc"}'::jsonb),
     ('signal', 'Signal', 'messaging', 'signal', true, '{"icon": "signal", "color": "#3A76F0"}'::jsonb),
-    ('whatsapp', 'WhatsApp', 'messaging', 'whatsapp', true, '{"icon": "whatsapp", "color": "#25D366"}'::jsonb)
+    ('whatsapp', 'WhatsApp', 'messaging', 'whatsapp', true, '{"icon": "whatsapp", "color": "#25D366"}'::jsonb),
+    ('slack', 'Slack', 'messaging', 'slack', true, '{"icon": "slack", "color": "#4A154B"}'::jsonb)
 ON CONFLICT (id) DO NOTHING;
 
 DO $$

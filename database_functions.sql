@@ -188,6 +188,81 @@ $$;
 COMMENT ON FUNCTION dev.get_signal_token IS 
 'Returns Signal credentials with status for user. Convenience wrapper for get_valid_token.';
 
+-- Get Slack token/credentials (for first workspace - use get_slack_token_by_team for specific workspace)
+CREATE OR REPLACE FUNCTION dev.get_slack_token(p_user_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT dev.get_valid_token(p_user_id, 'slack');
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_token IS 
+'Returns Slack token details with expiration status for user. Returns first workspace if user has multiple. Use get_slack_token_by_team() for specific workspace. Convenience wrapper for get_valid_token.';
+
+-- Get Slack token for a specific workspace by team_id
+CREATE OR REPLACE FUNCTION dev.get_slack_token_by_team(p_user_id text, p_team_id text)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_integration RECORD;
+    v_is_expired boolean;
+BEGIN
+    -- Get the integration for specific workspace
+    SELECT 
+        ui.access_token,
+        ui.refresh_token,
+        ui.token_expiration_date,
+        ui.token_expires_at,
+        ui.refresh_expired,
+        ui.is_active,
+        ui.client_id,
+        ui.client_secret,
+        ui.granted_scopes,
+        ui.credentials->>'bot_user_id' AS bot_user_id,
+        ui.credentials->>'app_id' AS app_id
+    INTO v_integration
+    FROM dev.user_integrations ui
+    WHERE ui.user_id = p_user_id 
+      AND ui.service_id = 'slack'
+      AND ui.external_user_id = p_team_id
+      AND ui.is_active = true
+    LIMIT 1;
+    
+    -- If no integration found, return NULL
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    
+    -- Check if token is expired
+    v_is_expired := (
+        v_integration.access_token IS NULL 
+        OR v_integration.token_expiration_date IS NULL 
+        OR v_integration.token_expiration_date < now()
+    );
+    
+    -- Build and return JSON response with Slack-specific fields
+    RETURN jsonb_build_object(
+        'token', v_integration.access_token,
+        'refresh_token', v_integration.refresh_token,
+        'is_expired', v_is_expired,
+        'expires_at', v_integration.token_expiration_date,
+        'refresh_expired', COALESCE(v_integration.refresh_expired, false),
+        'client_id', v_integration.client_id,
+        'client_secret', v_integration.client_secret,
+        'granted_scopes', v_integration.granted_scopes,
+        'bot_user_id', v_integration.bot_user_id,
+        'app_id', v_integration.app_id,
+        'team_id', p_team_id
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_token_by_team IS 
+'Returns Slack token details for a specific workspace (team_id). Includes bot_user_id and app_id. Use this for event routing when you know the team_id.';
+
 -- ============================================================================
 -- FUNCTION 4: Additional Helper Functions
 -- ============================================================================
@@ -256,7 +331,36 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION dev.get_integration_by_external_id IS 
-'Finds user integration by service and external user ID (e.g., telegram_id). Useful for message routing.';
+'Finds user integration by service and external user ID (e.g., telegram_id, team_id). Useful for message routing.';
+
+-- Convenience wrapper for Slack: Get integration by team_id (for event routing)
+CREATE OR REPLACE FUNCTION dev.get_slack_integration_by_team(p_team_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'integration_id', ui.id,
+        'user_id', ui.user_id,
+        'service_id', ui.service_id,
+        'is_active', ui.is_active,
+        'external_user_id', ui.external_user_id,
+        'external_username', ui.external_username,
+        'access_token', ui.access_token,
+        'bot_user_id', ui.credentials->>'bot_user_id',
+        'app_id', ui.credentials->>'app_id',
+        'team_id', ui.external_user_id,
+        'team_name', ui.external_username
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.service_id = 'slack'
+      AND ui.external_user_id = p_team_id
+      AND ui.is_active = true
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_integration_by_team IS 
+'Finds Slack integration by team_id. Returns user_id, access_token, bot_user_id, and other workspace details. Use this for event routing when you receive a team_id from Slack.';
 
 -- Get WhatsApp user by WhatsApp ID
 CREATE OR REPLACE FUNCTION dev.get_whatsapp_user(p_whatsapp_id text)
@@ -739,6 +843,51 @@ $$;
 COMMENT ON FUNCTION dev.link_whatsapp_to_user IS 
 'Links WhatsApp service to user with whatsapp_id and optional credentials/metadata.';
 
+-- Convenience wrapper for Slack integration
+CREATE OR REPLACE FUNCTION dev.link_slack_to_user(
+    p_user_id text,
+    p_team_id text,
+    p_access_token text,
+    p_app_id text DEFAULT NULL,
+    p_team_name text DEFAULT NULL,
+    p_bot_user_id text DEFAULT NULL,
+    p_installing_user_id text DEFAULT NULL,
+    p_display_label text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL,
+    p_credentials jsonb DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE sql
+AS $$
+    SELECT dev.link_service_to_user(
+        p_user_id,
+        'slack',
+        p_team_id, -- external_user_id = team_id (workspace ID)
+        p_team_name, -- external_username = workspace name
+        COALESCE(p_display_label, p_team_name, 'Slack Workspace'),
+        p_access_token, -- bot token
+        NULL, -- refresh_token (Slack tokens don't expire)
+        now() + interval '10 years', -- token_expiration_date (set far future so get_valid_token works correctly)
+        NULL, -- client_id
+        NULL, -- client_secret
+        NULL, -- auth_code
+        NULL, -- granted_scopes
+        COALESCE(p_credentials, jsonb_build_object(
+            'app_id', p_app_id,
+            'bot_user_id', p_bot_user_id,
+            'installing_user_id', p_installing_user_id
+        )),
+        COALESCE(p_metadata, jsonb_build_object(
+            'app_id', p_app_id,
+            'team_id', p_team_id,
+            'team_name', p_team_name
+        ))
+    );
+$$;
+
+COMMENT ON FUNCTION dev.link_slack_to_user IS 
+'Links Slack workspace to user. Uses team_id as external_user_id to allow multiple workspace installations per user. Sets token_expiration_date to 10 years in the future so get_valid_token() works correctly (Slack tokens don''t expire).';
+
 -- ============================================================================
 -- FUNCTION 6: Service Unlinking Functions (DEACTIVATE Operations)
 -- ============================================================================
@@ -843,6 +992,194 @@ $$;
 
 COMMENT ON FUNCTION dev.unlink_whatsapp_from_user IS 
 'Deactivates WhatsApp integration for user. Optionally specify whatsapp_id for multiple integrations.';
+
+-- Convenience wrapper for Slack
+CREATE OR REPLACE FUNCTION dev.unlink_slack_from_user(p_user_id text, p_team_id text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE sql
+AS $$
+    SELECT dev.unlink_service_from_user(p_user_id, 'slack', p_team_id);
+$$;
+
+COMMENT ON FUNCTION dev.unlink_slack_from_user IS 
+'Deactivates Slack workspace integration for user. Specify team_id to unlink a specific workspace.';
+
+-- Helper function to get all Slack workspaces for a user
+CREATE OR REPLACE FUNCTION dev.get_user_slack_workspaces(p_user_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'integration_id', ui.id,
+            'team_id', ui.external_user_id,
+            'team_name', ui.external_username,
+            'app_id', ui.credentials->>'app_id',
+            'display_label', ui.display_label,
+            'is_active', ui.is_active,
+            'bot_user_id', ui.credentials->>'bot_user_id',
+            'installing_user_id', ui.credentials->>'installing_user_id',
+            'metadata', ui.metadata,
+            'created_at', ui.created_at,
+            'updated_at', ui.updated_at
+        )
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.user_id = p_user_id
+      AND ui.service_id = 'slack'
+    ORDER BY ui.created_at DESC;
+$$;
+
+COMMENT ON FUNCTION dev.get_user_slack_workspaces IS 
+'Returns all Slack workspace installations for a user as JSONB array.';
+
+-- Helper function to get Slack workspace by app_id and team_id
+CREATE OR REPLACE FUNCTION dev.get_slack_workspace(
+    p_user_id text,
+    p_app_id text,
+    p_team_id text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'integration_id', ui.id,
+        'team_id', ui.external_user_id,
+        'team_name', ui.external_username,
+        'app_id', ui.credentials->>'app_id',
+        'display_label', ui.display_label,
+        'is_active', ui.is_active,
+        'bot_user_id', ui.credentials->>'bot_user_id',
+        'installing_user_id', ui.credentials->>'installing_user_id',
+        'access_token', ui.access_token,
+        'metadata', ui.metadata,
+        'created_at', ui.created_at,
+        'updated_at', ui.updated_at
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.user_id = p_user_id
+      AND ui.service_id = 'slack'
+      AND ui.credentials->>'app_id' = p_app_id
+      AND (p_team_id IS NULL OR ui.external_user_id = p_team_id)
+    ORDER BY ui.created_at DESC
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_workspace IS 
+'Returns a specific Slack workspace installation by app_id (and optionally team_id). Useful for filtering by app when user has multiple Slack apps.';
+
+-- Link individual Slack user to Tomo user (for DM routing)
+-- This creates a mapping: Slack user ID → Tomo user ID
+CREATE OR REPLACE FUNCTION dev.link_slack_user_to_tomo_user(
+    p_tomo_user_id text,
+    p_slack_user_id text,
+    p_workspace_team_id text,
+    p_slack_username text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE sql
+AS $$
+    SELECT dev.link_service_to_user(
+        p_tomo_user_id,
+        'slack',
+        p_slack_user_id, -- external_user_id = Slack user ID (not team_id!)
+        p_slack_username, -- external_username = Slack username
+        COALESCE('Slack User: ' || p_slack_username, 'Slack User'),
+        NULL, -- access_token (workspace row has it)
+        NULL, -- refresh_token
+        NULL, -- token_expiration_date
+        NULL, -- client_id
+        NULL, -- client_secret
+        NULL, -- auth_code
+        NULL, -- granted_scopes
+        NULL, -- credentials
+        jsonb_build_object(
+            'workspace_team_id', p_workspace_team_id,
+            'slack_user_id', p_slack_user_id
+        ) -- metadata stores workspace context
+    );
+$$;
+
+COMMENT ON FUNCTION dev.link_slack_user_to_tomo_user IS 
+'Links an individual Slack user to a Tomo user. Use this when a Slack user wants to DM your bot. Stores workspace_team_id in metadata for lookup.';
+
+-- Get Tomo user ID for a Slack user (for event routing)
+CREATE OR REPLACE FUNCTION dev.get_tomo_user_by_slack_user(
+    p_slack_user_id text,
+    p_workspace_team_id text
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'tomo_user_id', ui.user_id,
+        'slack_user_id', ui.external_user_id,
+        'workspace_team_id', ui.metadata->>'workspace_team_id',
+        'integration_id', ui.id
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.service_id = 'slack'
+      AND ui.external_user_id = p_slack_user_id
+      AND ui.metadata->>'workspace_team_id' = p_workspace_team_id
+      AND ui.is_active = true
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_tomo_user_by_slack_user IS 
+'Finds Tomo user ID for a Slack user. Use this in event routing when you receive a DM from a Slack user. Returns NULL if not linked.';
+
+-- Auto-create Tomo user and link Slack user (for unknown Slack users)
+CREATE OR REPLACE FUNCTION dev.auto_create_tomo_user_from_slack(
+    p_slack_user_id text,
+    p_workspace_team_id text,
+    p_slack_email text,
+    p_slack_name text DEFAULT NULL,
+    p_slack_username text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_tomo_user_id text;
+    v_integration_result jsonb;
+BEGIN
+    -- Generate new Tomo user ID (or use your ID generation logic)
+    v_tomo_user_id := gen_random_uuid()::text;
+    
+    -- Create Tomo user
+    INSERT INTO dev.users (id, email, display_name, created_at)
+    VALUES (
+        v_tomo_user_id,
+        COALESCE(p_slack_email, p_slack_user_id || '@slack.local'),
+        COALESCE(p_slack_name, p_slack_username, 'Slack User'),
+        now()
+    );
+    
+    -- Link Slack user to new Tomo user
+    v_integration_result := dev.link_slack_user_to_tomo_user(
+        v_tomo_user_id,
+        p_slack_user_id,
+        p_workspace_team_id,
+        p_slack_username
+    );
+    
+    -- Return both user and integration info
+    RETURN jsonb_build_object(
+        'success', true,
+        'tomo_user_id', v_tomo_user_id,
+        'email', COALESCE(p_slack_email, p_slack_user_id || '@slack.local'),
+        'display_name', COALESCE(p_slack_name, p_slack_username, 'Slack User'),
+        'integration', v_integration_result,
+        'created_at', now()
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION dev.auto_create_tomo_user_from_slack IS 
+'Auto-creates a Tomo user from Slack user info and links them. Use this when an unknown Slack user DMs the bot. Returns new user_id and integration details.';
 
 -- ============================================================================
 -- FUNCTION 7: Token Update Functions
@@ -1344,6 +1681,31 @@ COMMENT ON FUNCTION dev.cleanup_orphaned_integrations IS
 
 -- Example 12: Link Signal to user
 -- SELECT dev.link_signal_to_user('user_123', 'signal_uuid_abc', 'Signal Integration');
+
+-- Example 12a: Link Slack workspace to user (after OAuth installation)
+-- SELECT dev.link_slack_to_user(
+--   'user_123',
+--   'T01234567', -- team_id from Slack OAuth
+--   'xoxb-1234567890-abcdefghijklmnop', -- bot token
+--   'A01234567', -- app_id (your Slack app ID)
+--   'My Workspace', -- team_name
+--   'U01234567', -- bot_user_id
+--   'U09876543' -- installing_user_id
+-- );
+
+-- Example 12b: Get all Slack workspaces for a user
+-- SELECT dev.get_user_slack_workspaces('user_123');
+
+-- Example 12c: Get Slack token (first workspace if multiple)
+-- SELECT dev.get_slack_token('user_123');
+
+-- Example 12d: Get Slack token for specific workspace (event routing)
+-- SELECT dev.get_slack_token_by_team('user_123', 'T01234567');
+-- Returns: {"token": "xoxb-...", "bot_user_id": "U09U4508SFK", "app_id": "A09U4GD1064", "team_id": "T01234567", ...}
+
+-- Example 12e: Get Slack integration by team_id (event routing - alternative)
+-- SELECT dev.get_slack_integration_by_team('T01234567');
+-- Returns: {"user_id": "user_123", "access_token": "xoxb-...", "bot_user_id": "U09U4508SFK", ...}
 
 -- Example 13: Unlink Gmail from user
 -- SELECT dev.unlink_gmail_from_user('user_123');

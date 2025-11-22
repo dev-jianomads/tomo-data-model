@@ -888,6 +888,87 @@ $$;
 COMMENT ON FUNCTION dev.link_slack_to_user IS 
 'Links Slack workspace to user. Uses team_id as external_user_id to allow multiple workspace installations per user. Sets token_expiration_date to 10 years in the future so get_valid_token() works correctly (Slack tokens don''t expire).';
 
+-- Link Slack workspace and auto-create Tomo user if needed (for OAuth installation)
+-- Use this when the installing user might not be a Tomo user yet
+CREATE OR REPLACE FUNCTION dev.link_slack_workspace_or_create_user(
+    p_installing_slack_user_id text,
+    p_installing_slack_email text,
+    p_team_id text,
+    p_access_token text,
+    p_installing_slack_name text DEFAULT NULL,
+    p_installing_slack_username text DEFAULT NULL,
+    p_app_id text DEFAULT NULL,
+    p_team_name text DEFAULT NULL,
+    p_bot_user_id text DEFAULT NULL,
+    p_display_label text DEFAULT NULL,
+    p_metadata jsonb DEFAULT NULL,
+    p_credentials jsonb DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_tomo_user_id text;
+    v_user_created boolean := false;
+    v_workspace_result jsonb;
+    v_user_link_result jsonb;
+BEGIN
+    -- Try to find existing Tomo user by email first
+    SELECT id INTO v_tomo_user_id
+    FROM dev.users
+    WHERE email = p_installing_slack_email
+    LIMIT 1;
+    
+    -- If no user found, create new Tomo user
+    IF v_tomo_user_id IS NULL THEN
+        v_tomo_user_id := gen_random_uuid()::text;
+        v_user_created := true;
+        
+        INSERT INTO dev.users (id, email, display_name, created_at)
+        VALUES (
+            v_tomo_user_id,
+            COALESCE(p_installing_slack_email, p_installing_slack_user_id || '@slack.local'),
+            COALESCE(p_installing_slack_name, p_installing_slack_username, 'Slack User'),
+            now()
+        );
+    END IF;
+    
+    -- Link workspace to Tomo user
+    v_workspace_result := dev.link_slack_to_user(
+        v_tomo_user_id,
+        p_team_id,
+        p_access_token,
+        p_app_id,
+        p_team_name,
+        p_bot_user_id,
+        p_installing_slack_user_id,
+        p_display_label,
+        p_metadata,
+        p_credentials
+    );
+    
+    -- Also link the installing Slack user to Tomo user (for DM routing)
+    v_user_link_result := dev.link_slack_user_to_tomo_user(
+        v_tomo_user_id,
+        p_installing_slack_user_id,
+        p_team_id,
+        p_installing_slack_username
+    );
+    
+    -- Return combined result
+    RETURN jsonb_build_object(
+        'success', true,
+        'tomo_user_id', v_tomo_user_id,
+        'user_created', v_user_created,
+        'workspace', v_workspace_result,
+        'user_link', v_user_link_result
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION dev.link_slack_workspace_or_create_user IS 
+'Links Slack workspace to Tomo user, creating the user if they don''t exist. Use this during OAuth installation when the installing user might not be a Tomo user yet. Also links the installing Slack user for DM routing.';
+
 -- ============================================================================
 -- FUNCTION 6: Service Unlinking Functions (DEACTIVATE Operations)
 -- ============================================================================
@@ -1024,11 +1105,11 @@ AS $$
             'created_at', ui.created_at,
             'updated_at', ui.updated_at
         )
+        ORDER BY ui.created_at DESC
     )
     FROM dev.user_integrations ui
     WHERE ui.user_id = p_user_id
-      AND ui.service_id = 'slack'
-    ORDER BY ui.created_at DESC;
+      AND ui.service_id = 'slack';
 $$;
 
 COMMENT ON FUNCTION dev.get_user_slack_workspaces IS 
@@ -1106,7 +1187,7 @@ COMMENT ON FUNCTION dev.link_slack_user_to_tomo_user IS
 'Links an individual Slack user to a Tomo user. Use this when a Slack user wants to DM your bot. Stores workspace_team_id in metadata for lookup.';
 
 -- Get Tomo user ID for a Slack user (for event routing)
-CREATE OR REPLACE FUNCTION dev.get_tomo_user_by_slack_user(
+CREATE OR REPLACE FUNCTION dev.get_user_by_slack_user_and_workspace(
     p_slack_user_id text,
     p_workspace_team_id text
 )
@@ -1128,8 +1209,56 @@ AS $$
     LIMIT 1;
 $$;
 
-COMMENT ON FUNCTION dev.get_tomo_user_by_slack_user IS 
-'Finds Tomo user ID for a Slack user. Use this in event routing when you receive a DM from a Slack user. Returns NULL if not linked.';
+COMMENT ON FUNCTION dev.get_user_by_slack_user_and_workspace IS 
+'Finds Tomo user ID for a Slack user in a specific workspace. Use this in event routing when you receive a DM from a Slack user and need workspace-specific routing. Returns NULL if not linked.';
+
+-- Get Slack user by Slack user ID (simple lookup, similar to WhatsApp)
+-- Returns first match if user is linked in multiple workspaces
+CREATE OR REPLACE FUNCTION dev.get_slack_user(p_slack_user_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_build_object(
+        'integration_id', ui.id,
+        'user_id', ui.user_id,
+        'service_id', ui.service_id,
+        'is_active', ui.is_active,
+        'external_user_id', ui.external_user_id,
+        'external_username', ui.external_username,
+        'display_label', ui.display_label,
+        'workspace_team_id', ui.metadata->>'workspace_team_id',
+        'created_at', ui.created_at,
+        'updated_at', ui.updated_at
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.service_id = 'slack'
+      AND ui.external_user_id = p_slack_user_id
+      AND ui.is_active = true
+    ORDER BY ui.created_at ASC
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_user IS 
+'Finds user by Slack user ID. Returns user integration details for Slack service. Similar to get_whatsapp_user(). Returns first match if user is linked in multiple workspaces.';
+
+-- Get user ID by Slack user ID (simple text return, similar to Telegram)
+CREATE OR REPLACE FUNCTION dev.get_user_id_by_slack_user_id(p_slack_user_id text)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT user_id 
+    FROM dev.user_integrations 
+    WHERE service_id = 'slack' 
+      AND external_user_id = p_slack_user_id
+      AND is_active = true
+    ORDER BY created_at ASC
+    LIMIT 1;
+$$;
+
+COMMENT ON FUNCTION dev.get_user_id_by_slack_user_id IS 
+'Returns Tomo user ID for a Slack user ID. Simple text return, similar to get_user_id_by_telegram_id(). Returns first match if user is linked in multiple workspaces.';
 
 -- Auto-create Tomo user and link Slack user (for unknown Slack users)
 CREATE OR REPLACE FUNCTION dev.auto_create_tomo_user_from_slack(

@@ -196,7 +196,7 @@ WHERE service_id = 'slack' AND external_user_id = :team_id;
 
 3. **Check if this Slack user exists in our system:**
 ```sql
-SELECT dev.get_tomo_user_by_slack_user(:slack_user_id, :team_id);
+SELECT dev.get_user_by_slack_user_and_workspace(:slack_user_id, :team_id);
 ```
 
 **What happens next depends on the result:**
@@ -420,7 +420,7 @@ FROM dev.user_integrations
 WHERE service_id = 'slack' AND external_user_id = :team_id;
 
 -- 2. Check if Slack user exists
-SELECT dev.get_tomo_user_by_slack_user(:slack_user_id, :team_id);
+SELECT dev.get_user_by_slack_user_and_workspace(:slack_user_id, :team_id);
 
 -- 3a. If user EXISTS: Route DM to that tomo_user_id
 -- 3b. If user DOES NOT EXIST: Auto-create

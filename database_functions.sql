@@ -875,7 +875,7 @@ AS $$
         COALESCE(p_credentials, jsonb_build_object(
             'app_id', p_app_id,
             'bot_user_id', p_bot_user_id,
-            'installing_user_id', p_installing_user_id
+            'slack_user_id', p_installing_user_id
         )),
         COALESCE(p_metadata, jsonb_build_object(
             'app_id', p_app_id,
@@ -1100,7 +1100,7 @@ AS $$
             'display_label', ui.display_label,
             'is_active', ui.is_active,
             'bot_user_id', ui.credentials->>'bot_user_id',
-            'installing_user_id', ui.credentials->>'installing_user_id',
+            'slack_user_id', ui.credentials->>'slack_user_id',
             'metadata', ui.metadata,
             'created_at', ui.created_at,
             'updated_at', ui.updated_at
@@ -1133,7 +1133,7 @@ AS $$
         'display_label', ui.display_label,
         'is_active', ui.is_active,
         'bot_user_id', ui.credentials->>'bot_user_id',
-        'installing_user_id', ui.credentials->>'installing_user_id',
+        'slack_user_id', ui.credentials->>'slack_user_id',
         'access_token', ui.access_token,
         'metadata', ui.metadata,
         'created_at', ui.created_at,
@@ -1152,7 +1152,9 @@ COMMENT ON FUNCTION dev.get_slack_workspace IS
 'Returns a specific Slack workspace installation by app_id (and optionally team_id). Useful for filtering by app when user has multiple Slack apps.';
 
 -- Link individual Slack user to Tomo user (for DM routing)
--- This creates a mapping: Slack user ID → Tomo user ID
+-- DEPRECATED: This creates a separate user mapping row, but we should just use workspace rows.
+-- For now, this updates the workspace row's credentials->>'slack_user_id' to point to the new user.
+-- TODO: Consider removing this function and just updating workspace rows directly.
 CREATE OR REPLACE FUNCTION dev.link_slack_user_to_tomo_user(
     p_tomo_user_id text,
     p_slack_user_id text,
@@ -1160,33 +1162,47 @@ CREATE OR REPLACE FUNCTION dev.link_slack_user_to_tomo_user(
     p_slack_username text DEFAULT NULL
 )
 RETURNS jsonb
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
-    SELECT dev.link_service_to_user(
-        p_tomo_user_id,
-        'slack',
-        p_slack_user_id, -- external_user_id = Slack user ID (not team_id!)
-        p_slack_username, -- external_username = Slack username
-        COALESCE('Slack User: ' || p_slack_username, 'Slack User'),
-        NULL, -- access_token (workspace row has it)
-        NULL, -- refresh_token
-        NULL, -- token_expiration_date
-        NULL, -- client_id
-        NULL, -- client_secret
-        NULL, -- auth_code
-        NULL, -- granted_scopes
-        NULL, -- credentials
-        jsonb_build_object(
-            'workspace_team_id', p_workspace_team_id,
-            'slack_user_id', p_slack_user_id
-        ) -- metadata stores workspace context
+DECLARE
+    v_workspace_row RECORD;
+    v_result jsonb;
+BEGIN
+    -- Find the workspace row for this team_id
+    SELECT * INTO v_workspace_row
+    FROM dev.user_integrations
+    WHERE service_id = 'slack'
+      AND external_user_id = p_workspace_team_id
+      AND is_active = true
+    LIMIT 1;
+    
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Workspace with team_id % not found', p_workspace_team_id;
+    END IF;
+    
+    -- Update the workspace row to point to the new user and store slack_user_id
+    UPDATE dev.user_integrations
+    SET 
+        user_id = p_tomo_user_id,
+        credentials = COALESCE(credentials, '{}'::jsonb) || jsonb_build_object('slack_user_id', p_slack_user_id),
+        updated_at = now()
+    WHERE id = v_workspace_row.id;
+    
+    RETURN jsonb_build_object(
+        'success', true,
+        'integration_id', v_workspace_row.id,
+        'user_id', p_tomo_user_id,
+        'slack_user_id', p_slack_user_id,
+        'workspace_team_id', p_workspace_team_id
     );
+END;
 $$;
 
 COMMENT ON FUNCTION dev.link_slack_user_to_tomo_user IS 
-'Links an individual Slack user to a Tomo user. Use this when a Slack user wants to DM your bot. Stores workspace_team_id in metadata for lookup.';
+'DEPRECATED: Updates workspace row to link Slack user to Tomo user. Consider using workspace rows directly instead of separate mapping rows.';
 
 -- Get Tomo user ID for a Slack user (for event routing)
+-- Simplified: Only workspace rows exist. Check credentials->>'slack_user_id' in workspace rows
 CREATE OR REPLACE FUNCTION dev.get_user_by_slack_user_and_workspace(
     p_slack_user_id text,
     p_workspace_team_id text
@@ -1197,14 +1213,14 @@ STABLE
 AS $$
     SELECT jsonb_build_object(
         'tomo_user_id', ui.user_id,
-        'slack_user_id', ui.external_user_id,
-        'workspace_team_id', ui.metadata->>'workspace_team_id',
+        'slack_user_id', ui.credentials->>'slack_user_id',
+        'workspace_team_id', ui.external_user_id,
         'integration_id', ui.id
     )
     FROM dev.user_integrations ui
     WHERE ui.service_id = 'slack'
-      AND ui.external_user_id = p_slack_user_id
-      AND ui.metadata->>'workspace_team_id' = p_workspace_team_id
+      AND ui.external_user_id = p_workspace_team_id
+      AND ui.credentials->>'slack_user_id' = p_slack_user_id
       AND ui.is_active = true
     LIMIT 1;
 $$;
@@ -1214,6 +1230,8 @@ COMMENT ON FUNCTION dev.get_user_by_slack_user_and_workspace IS
 
 -- Get Slack user by Slack user ID (simple lookup, similar to WhatsApp)
 -- Returns first match if user is linked in multiple workspaces
+-- external_user_id is team_id, slack_user_id is in credentials->>'slack_user_id'
+-- Checks both workspace rows (Type 1) and user mapping rows (Type 2)
 CREATE OR REPLACE FUNCTION dev.get_slack_user(p_slack_user_id text)
 RETURNS jsonb
 LANGUAGE sql
@@ -1224,16 +1242,17 @@ AS $$
         'user_id', ui.user_id,
         'service_id', ui.service_id,
         'is_active', ui.is_active,
+        'slack_user_id', ui.credentials->>'slack_user_id',
         'external_user_id', ui.external_user_id,
         'external_username', ui.external_username,
         'display_label', ui.display_label,
-        'workspace_team_id', ui.metadata->>'workspace_team_id',
+        'workspace_team_id', ui.external_user_id,
         'created_at', ui.created_at,
         'updated_at', ui.updated_at
     )
     FROM dev.user_integrations ui
     WHERE ui.service_id = 'slack'
-      AND ui.external_user_id = p_slack_user_id
+      AND ui.credentials->>'slack_user_id' = p_slack_user_id
       AND ui.is_active = true
     ORDER BY ui.created_at ASC
     LIMIT 1;
@@ -1243,6 +1262,9 @@ COMMENT ON FUNCTION dev.get_slack_user IS
 'Finds user by Slack user ID. Returns user integration details for Slack service. Similar to get_whatsapp_user(). Returns first match if user is linked in multiple workspaces.';
 
 -- Get user ID by Slack user ID (simple text return, similar to Telegram)
+-- external_user_id is team_id, slack_user_id is in credentials->>'slack_user_id'
+-- NOTE: If Slack user is in multiple workspaces, returns first match.
+-- For workspace-specific lookups, use get_user_by_slack_user_and_workspace() instead.
 CREATE OR REPLACE FUNCTION dev.get_user_id_by_slack_user_id(p_slack_user_id text)
 RETURNS text
 LANGUAGE sql
@@ -1251,14 +1273,43 @@ AS $$
     SELECT user_id 
     FROM dev.user_integrations 
     WHERE service_id = 'slack' 
-      AND external_user_id = p_slack_user_id
+      AND credentials->>'slack_user_id' = p_slack_user_id
       AND is_active = true
     ORDER BY created_at ASC
     LIMIT 1;
 $$;
 
 COMMENT ON FUNCTION dev.get_user_id_by_slack_user_id IS 
-'Returns Tomo user ID for a Slack user ID. Simple text return, similar to get_user_id_by_telegram_id(). Returns first match if user is linked in multiple workspaces.';
+'Returns Tomo user ID for a Slack user ID. Returns first match if user is linked in multiple workspaces. For workspace-specific lookups (recommended), use get_user_by_slack_user_and_workspace(slack_user_id, team_id) instead.';
+
+-- Get all workspaces for a Slack user (returns all rows where this Slack user is linked)
+CREATE OR REPLACE FUNCTION dev.get_slack_user_workspaces(p_slack_user_id text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'integration_id', ui.id,
+            'user_id', ui.user_id,
+            'workspace_team_id', ui.external_user_id,
+            'workspace_name', ui.external_username,
+            'app_id', ui.credentials->>'app_id',
+            'bot_user_id', ui.credentials->>'bot_user_id',
+            'is_active', ui.is_active,
+            'created_at', ui.created_at,
+            'updated_at', ui.updated_at
+        )
+        ORDER BY ui.created_at ASC
+    )
+    FROM dev.user_integrations ui
+    WHERE ui.service_id = 'slack'
+      AND ui.credentials->>'slack_user_id' = p_slack_user_id
+      AND ui.is_active = true;
+$$;
+
+COMMENT ON FUNCTION dev.get_slack_user_workspaces IS 
+'Returns all workspaces where a Slack user is linked. Useful when a Slack user belongs to multiple workspaces. Returns JSONB array of workspace objects.';
 
 -- Auto-create Tomo user and link Slack user (for unknown Slack users)
 CREATE OR REPLACE FUNCTION dev.auto_create_tomo_user_from_slack(

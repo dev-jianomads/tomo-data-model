@@ -598,3 +598,98 @@ $$;
 COMMENT ON FUNCTION public.auto_create_tomo_user_from_slack IS 
 'Auto-creates a Tomo user from Slack user info and links them to an existing workspace. Use this when an unknown Slack user DMs the bot. Returns new user_id and integration details.';
 
+-- ============================================================================
+-- MESSAGE FUNCTIONS
+-- ============================================================================
+
+-- Get last N Slack messages for a user
+-- Similar to get_user_telegram_messages, but adapted for Slack's structure
+-- For Slack: external_user_id = team_id, slack_user_id is in credentials->>'slack_user_id'
+-- NOTE: p_user_id is the internal Tomo user_id, NOT the Slack user_id
+CREATE OR REPLACE FUNCTION public.get_user_slack_messages(
+    p_user_id text,
+    p_limit int DEFAULT 8,
+    p_direction text DEFAULT 'inbound',
+    p_team_id text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'id', id,
+            'text', text,
+            'ts', ts,
+            'direction', direction,
+            'sender_id', sender_id,
+            'team_id', team_id
+        )
+    )
+    FROM (
+        SELECT 
+            sm.id,
+            sm.text,
+            coalesce(sm.slack_message_ts_utc, sm.created_at) as ts,
+            sm.direction,
+            sm.sender_id,
+            ui.external_user_id as team_id
+        FROM public.slack_messages sm
+        JOIN public.user_integrations ui ON 
+            ui.credentials->>'slack_user_id' = sm.sender_id
+        WHERE ui.user_id = p_user_id
+          AND ui.service_id = 'slack'
+          AND ui.is_active = true
+          AND sm.direction = p_direction
+          AND sm.text IS NOT NULL
+          AND (p_team_id IS NULL OR ui.external_user_id = p_team_id)
+        ORDER BY coalesce(sm.slack_message_ts_utc, sm.created_at) DESC
+        LIMIT p_limit
+    ) sub;
+$$;
+
+COMMENT ON FUNCTION public.get_user_slack_messages IS 
+'Returns last N Slack messages for a user as JSONB array. p_user_id is the internal Tomo user_id (not Slack user_id). Defaults to 8 inbound messages. Optionally filter by team_id for workspace-specific messages.';
+
+-- Alternative function returning table format (for easier joins)
+-- NOTE: p_user_id is the internal Tomo user_id, NOT the Slack user_id
+CREATE OR REPLACE FUNCTION public.get_user_slack_messages_table(
+    p_user_id text,
+    p_limit int DEFAULT 8,
+    p_direction text DEFAULT 'inbound',
+    p_team_id text DEFAULT NULL
+)
+RETURNS TABLE (
+    id bigint,
+    text text,
+    ts timestamp with time zone,
+    direction text,
+    sender_id text,
+    team_id text
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT 
+        sm.id,
+        sm.text,
+        coalesce(sm.slack_message_ts_utc, sm.created_at) as ts,
+        sm.direction,
+        sm.sender_id,
+        ui.external_user_id as team_id
+    FROM public.slack_messages sm
+    JOIN public.user_integrations ui ON 
+        ui.credentials->>'slack_user_id' = sm.sender_id
+    WHERE ui.user_id = p_user_id
+      AND ui.service_id = 'slack'
+      AND ui.is_active = true
+      AND sm.direction = p_direction
+      AND sm.text IS NOT NULL
+      AND (p_team_id IS NULL OR ui.external_user_id = p_team_id)
+    ORDER BY coalesce(sm.slack_message_ts_utc, sm.created_at) DESC
+    LIMIT p_limit;
+$$;
+
+COMMENT ON FUNCTION public.get_user_slack_messages_table IS 
+'Returns last N Slack messages for a user as table. p_user_id is the internal Tomo user_id (not Slack user_id). Defaults to 8 inbound messages. Use this for JOINs or when you need individual columns. Optionally filter by team_id for workspace-specific messages.';
+
